@@ -1,0 +1,844 @@
+# -- coding: utf-8 --
+"""
+Offer generator (RAG + Multi-item Excel-priced BOM fallback)
+UPDATES:
+- Unit estimate line: "Pricing: $X × Qty N = $Y"
+- Dimensions parsed from the user's note are injected per item (and overwrite)
+- No "?" in dimensions; omit unknown parts
+- Qty already multiplies line totals
+- NEW: If no exact items, ask for similar; on 'no', print a friendly message and exit
+"""
+
+import os, re, json, uuid, random
+import fitz
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+import difflib
+from typing import List, Dict, Any, Optional, Tuple
+
+import pandas as pd
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+DEBUG = True
+COST_BOOK_PATH = "cost_book.xlsx"
+EXCEL_SHEET = None  # auto-detect first sheet
+
+# ---------- Pricing realism knobs (materials-only) ----------
+WASTAGE_FACTOR = 1.25
+CATEGORY_MIN_USD = {"table":80.0,"desk":100.0,"futon":140.0,"sofa":160.0,"shelf":40.0,"chair":50.0}
+GENERIC_MIN_USD = 50.0
+
+# ---------- Decline message (exact string you requested) ----------
+DECLINE_MSG = ("We currently are not able to fulllfill your requirenment but will contact you in 1 week "
+               "to let you know if the similar item can be deilbverd to you")
+
+# ----------------------------- #
+# Together.ai Chat Completion
+# ----------------------------- #
+def together_chat(messages, model="mistralai/Mistral-7B-Instruct-v0.3", temperature=0.0, max_tokens=900):
+    load_dotenv()
+    api_key = os.getenv("TOGETHER_API_KEY")
+    if not api_key:
+        raise RuntimeError("TOGETHER_API_KEY not set in environment/.env")
+    url = "https://api.together.xyz/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        raise Exception(f"API Error: {r.status_code} - {r.text}")
+    return r.json()["choices"][0]["message"]["content"]
+
+# ----------------------------- #
+# JSON tolerance helpers
+# ----------------------------- #
+_TRAILING_COMMAS = re.compile(r",\s*([}\]])")
+_SINGLE_QUOTE = re.compile(r"(?<=[:\s\[,])'([^']*)'(?=\s*[,}\]])")
+def extract_json_object(text: str) -> Optional[dict]:
+    if not text: return None
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I|re.S).strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end == -1 or end <= start: return None
+    t = _TRAILING_COMMAS.sub(r"\1", t[start:end+1])
+    t = _SINGLE_QUOTE.sub(r'"\1"', t)
+    try: return json.loads(t)
+    except Exception: return None
+
+# ----------------------------- #
+# Load Offer Documents (chunked + whole-file)
+# ----------------------------- #
+def load_offer_documents(folder_path):
+    print(f"📂 Loading from '{folder_path}'...")
+    chunked_docs, full_docs = [], []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=120)
+    for file in os.listdir(folder_path):
+        if not file.lower().endswith(".pdf"): continue
+        path = os.path.join(folder_path, file)
+        raw_docs = PyMuPDFLoader(path).load()
+        base = os.path.splitext(file)[0].lower()
+        category_hint = base.replace("-", " ").replace("_", " ")
+        first_token = category_hint.split()[0] if category_hint else ""
+        whole = raw_docs[0].copy()
+        whole.page_content = "\n".join(d.page_content for d in raw_docs)
+        whole.metadata = (whole.metadata or {}) | {"source_file": file, "category": first_token}
+        full_docs.append(whole)
+        prepared=[]
+        for d in raw_docs:
+            d.metadata = (d.metadata or {}) | {"source_file": file, "category": first_token}
+            d.page_content = f"TITLE: {base}\nCONTENT:\n{d.page_content}"
+            prepared.append(d)
+        chunked_docs.extend(splitter.split_documents(prepared))
+    if not chunked_docs: raise RuntimeError(f"No PDFs found in '{folder_path}'.")
+    print(f"✅ Loaded {len(chunked_docs)} chunks from {len(full_docs)} PDFs.")
+    return chunked_docs, full_docs
+
+# ----------------------------- #
+# Vector stores
+# ----------------------------- #
+EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+def create_vectorstores(docs, faiss_path="faiss_index"):
+    embedding = HuggingFaceEmbeddings(model_name=EMB_MODEL, encode_kwargs={"normalize_embeddings": True})
+    vs = FAISS.from_documents(docs, embedding); vs.save_local(faiss_path)
+    bm25 = BM25Retriever.from_documents(docs)
+    return vs, bm25
+
+# ----------------------------- #
+# Intent utils / filters / search
+# ----------------------------- #
+FURNITURE_TYPES = ["bed","sofa","couch","chair","table","desk","wardrobe","cabinet","shelf","bookshelf","dresser","nightstand","stool","bench","futon","recliner"]
+COLORS = ["black","white","brown","oak","walnut","grey","gray","beige","natural","espresso","red","blue","copper"]
+MATERIALS = ["wood","wooden","engineered wood","bamboo","rattan","teak","metal","steel","iron","plywood","leather","fabric","plastic","glass","oak","pine","mdf","particleboard","foam"]
+FOLD_SYNS = ("foldable","folding","collapsible","portable","fold-away","fold away","fold up")
+EXCLUDE_KEYWORDS = ["connector","connectors","cover","covers","replacement","tool","clip","bolt","leg","kit","spare","part","accessory","accessories","fastener","screw","bracket","joint","hardware"]
+
+def parse_intent(q: str):
+    ql = q.lower()
+    ftype = next((t for t in FURNITURE_TYPES if t in ql), None)
+    color = next((c for c in COLORS if c in ql), None)
+    material = next((m for m in MATERIALS if m in ql), None)
+    return {"type": ftype, "color": color, "material": material, "ql": ql}
+
+def expand_query(q: str, intent):
+    ql = q.lower(); parts=[ql]
+    if intent["type"] == "table": parts += ["table","tables"] + list(FOLD_SYNS)
+    if "light" in ql: parts += ["lightweight","light weight","light-weight","portable"]
+    return " ".join(parts)
+
+def build_phrases(intent):
+    return ["round table","foldable table","adjustable table"] if intent["type"]=="table" else []
+
+def looks_like_main_furniture(text: str, intent: dict) -> bool:
+    low = text.lower(); t = intent.get("type")
+    if t and t not in low: return False
+    if any(bad in low for bad in EXCLUDE_KEYWORDS): return False
+    good = {"chair","sofa","couch","table","desk","bench","stool","bed","wardrobe","futon","recliner","shelf"}
+    return any(w in low for w in good) if t else True
+
+def hybrid_search(query, faiss_store, bm25_retriever, k=18):
+    dense = faiss_store.similarity_search_with_score(query, k=k*3)
+    sparse = bm25_retriever.get_relevant_documents(query)[:k*3]
+    scores, pool = {}, {}
+    for i,(d,_) in enumerate(dense): pool[id(d)] = d; scores[id(d)] = scores.get(id(d),0.0)+1.0/(1+i)
+    for i,d in enumerate(sparse): pool[id(d)] = d; scores[id(d)] = scores.get(id(d),0.0)+1.0/(1+i)
+    ranked = sorted(pool.values(), key=lambda doc: scores[id(doc)], reverse=True)
+    return ranked[:k]
+
+def literal_phrase_hits(full_docs, phrases):
+    return [d for d in full_docs if any(p in d.page_content.lower() for p in phrases)]
+
+def promote_hits(hit_files, all_chunks, k_each=6):
+    if not hit_files: return []
+    picks=[]
+    for d in all_chunks:
+        if (d.metadata or {}).get("source_file") in hit_files:
+            picks.append(d)
+            if len(picks) >= k_each * len(hit_files): break
+    return picks
+
+def rerank(query, docs, top_k=3):
+    try:
+        from sentence_transformers import CrossEncoder
+        ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        scores = ce.predict([(query, d.page_content[:1200]) for d in docs])
+        ranked = [d for _,d in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)][:top_k]
+        top_score = float(sorted(scores, reverse=True)[0]) if len(scores) else None
+        return ranked, top_score
+    except Exception:
+        return docs[:top_k], None
+
+def metadata_filter(docs, intent):
+    if not intent["type"]: return docs
+    t=intent["type"]; keep=[]
+    for d in docs:
+        cat=(d.metadata or {}).get("category",""); text=d.page_content.lower()
+        if t in cat or f" {t} " in (" "+text+" ") or text.startswith(f"title: {t}"): keep.append(d)
+    return keep or docs
+
+def keyword_gate(docs, intent):
+    if intent["type"]!="table": return docs
+    required_any=FOLD_SYNS; gated=[]
+    for d in docs:
+        t=d.page_content.lower()
+        if "table" in t and any(w in t for w in required_any): gated.append(d)
+    return gated or docs
+
+def match_product(user_query, faiss_store, bm25_retriever, all_chunks, full_docs):
+    intent = parse_intent(user_query)
+    boosted_files = {d.metadata.get("source_file") for d in literal_phrase_hits(full_docs, build_phrases(intent))}
+    boosted_chunks = promote_hits(boosted_files, all_chunks, k_each=6)
+    candidates = hybrid_search(expand_query(user_query, intent), faiss_store, bm25_retriever, k=24)
+    merged, seen = [], set()
+    for d in boosted_chunks + candidates:
+        key = (d.metadata.get("source_file"), d.page_content[:150])
+        if key not in seen: merged.append(d); seen.add(key)
+    merged = metadata_filter(merged, intent)
+    merged = keyword_gate(merged, intent)
+    merged = [d for d in merged if looks_like_main_furniture(d.page_content, intent)]
+    if DEBUG: print(f"🧹 Filtered to {len(merged)} furniture docs.")
+    if not merged: return "none", []
+    top_docs, top_score = rerank(user_query, merged, top_k=3)
+    if not top_docs: return "none", []
+    label="similar"
+    if top_score is not None and top_score>=0.55: label="exact"
+    if boosted_files: label="exact"
+    if intent["type"] and not any(intent["type"] in d.page_content.lower() for d in top_docs): return "none", []
+    if DEBUG:
+        print("\n🗂 Matched files:"); [print(" -", d.metadata.get("source_file")) for d in top_docs]
+    return label, top_docs
+
+# ----------------------------- #
+# Catalog extraction (LLM + regex fallback)
+# ----------------------------- #
+JSON_SYSTEM = "You extract product line items from catalog text. Return STRICT JSON ONLY. No markdown, no comments."
+PRICE_RE = re.compile(r'(?P<cur>€|EUR|\$|USD)\s*(?P<num>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)')
+BAD_PREFIXES = ("material","dimensions","brand","pos","qty","description","price","net","vat","total")
+
+def extract_items_via_llm(user_query, context, max_items=3):
+    schema_hint = {"items":[{"pos":1,"qty":1,"unit":"pc","name":"Product name","material":"Wood",
+                             "dimensions":"200x160x40 cm","brand":"Brand","description":"Short line.",
+                             "price":999.99,"currency":"USD"}]}
+    prompt = ("USER REQUEST:\n"+user_query+"\n\nPRODUCT CANDIDATES:\n"+context+
+              "\n\nSelect up to "+str(max_items)+" items. Merge multi-line titles, extract brand/dimensions, numeric price if present (else null). "
+              "Return strictly this JSON:\n"+json.dumps(schema_hint, ensure_ascii=False))
+    out = together_chat([{"role":"system","content":JSON_SYSTEM},{"role":"user","content":prompt}],
+                        temperature=0.0, max_tokens=700).strip()
+    out = re.sub(r"^```(?:json)?\s*|\s*```$","",out,flags=re.I|re.S)
+    try:
+        data = json.loads(out); assert isinstance(data.get("items",[]), list)
+        if DEBUG: print("LLM JSON:", json.dumps(data, indent=2)[:300], "...")
+        return data
+    except Exception:
+        if DEBUG: print("LLM JSON parse failed:\nRaw:", out[:300], "...")
+        return {"items":[]}
+
+def norm_amount(num: str) -> Optional[float]:
+    if num is None: return None
+    n = num.replace(" ","")
+    if n.count(",")>0 and n.count(".")>0:
+        if n.rfind(",")>n.rfind("."): n=n.replace(".","").replace(",",".")
+        else: n=n.replace(",","")
+    else: n=n.replace(",","")
+    try: return float(n)
+    except: return None
+
+def _is_bad_prefix(s:str)->bool:
+    return any(s.lower().strip().startswith(p+":") for p in BAD_PREFIXES)
+
+def _title_score(line: str, intent_type: Optional[str]) -> int:
+    s=line.strip()
+    if _is_bad_prefix(s) or len(s)<6 or len(s)>120 or re.search(r"^\s*(€|\$|\d)", s): return -5
+    score=1
+    if intent_type and intent_type in s.lower(): score+=4
+    score+=min(sum(1 for w in re.findall(r"[A-Za-z]+", s) if w[0].isupper()),4)
+    if "," in s or " - " in s: score+=1
+    return score
+
+ATTR_PREFIXES=("material","dimensions","brand","color","colour","size","model","sku")
+def is_attr_line(s:str)->bool:
+    s=s.strip().lower()
+    return bool(s) and any(s.startswith(p+":") for p in ATTR_PREFIXES)
+
+def looks_like_title_line(s:str)->bool:
+    s=s.strip()
+    if not s or is_attr_line(s) or re.match(r'^\s*(€|\$|usd|eur)\b',s.lower()): return False
+    return 8<=len(s)<=200 and len(re.findall(r'[A-Za-z]',s))>=6
+
+def should_merge(prev:str,nxt:str)->bool:
+    if not prev or not nxt or is_attr_line(nxt): return False
+    prev=prev.strip(); nxt=nxt.strip()
+    prev_end=prev[-1:]; nxt_first=(nxt.split()[0] if nxt.split() else "")
+    small={"and","with","for","by","of","to","in","on","at","a","an","the"}
+    return (prev_end not in ".:;•" or nxt_first.lower() in small or nxt[:1].islower())
+
+DIM_INLINE_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(?:\"|in|inch|inches|cm|mm)\s*(?:[x×]\s*\d+(?:\.\d+)?\s*(?:\"|in|inch|inches|cm|mm))(?:\s*[x×]\s*\d+(?:\.\d+)?\s*(?:\"|in|inch|inches|cm|mm))?(?:\s*[DWHL]\b|)',
+    re.I
+)
+
+def extract_brand_from_text(s:str)->Optional[str]:
+    m=re.search(r'\bbrand\s*:\s*(.+)',s,re.I)
+    if m: return m.group(1).strip().rstrip('.')
+    m=re.search(r'\bby\s+([A-Za-z][\w &\-\'.]{2,})',s)
+    if m: return m.group(1).strip().rstrip('.,')
+    m=re.search(r'([A-Z][\w &\-\'.]{2,}\s+Store)\b',s)
+    if m: return m.group(1).strip()
+    return None
+
+def extract_dimensions_from_text(s:str)->Optional[str]:
+    m=re.search(r'\bdimensions?\s*:\s*(.+)',s,re.I)
+    if m: return m.group(1).strip().rstrip('.')
+    m=DIM_INLINE_RE.search(s)
+    if m: return re.sub(r'\s{2,}',' ',m.group(0)).strip()
+    return None
+
+def extract_material_from_text(s:str)->Optional[str]:
+    m=re.search(r'\bmaterial\s*:\s*(.+)',s,re.I)
+    return m.group(1).strip().rstrip('.') if m else None
+
+def extract_items_rule_based(context:str,intent:dict,max_items=3):
+    lines=[l.strip() for l in context.splitlines() if l.strip()]
+    items=[]
+    for i,line in enumerate(lines):
+        m=PRICE_RE.search(line)
+        if not m: continue
+        window_idx=range(max(0,i-8),min(len(lines),i+9))
+        best_k,best_sc=None,-999
+        for k in window_idx:
+            cand=lines[k]; sc=_title_score(cand,intent.get("type"))
+            if sc>best_sc and looks_like_title_line(cand): best_sc,best_k=sc,k
+        if best_k is None:
+            for j in range(1,7):
+                k=i-j
+                if k<0: break
+                cand=lines[k]
+                if looks_like_title_line(cand): best_k=k; break
+        if best_k is None: best_k=i
+        title=lines[best_k]
+        k_up=best_k-1
+        while k_up>=0 and looks_like_title_line(lines[k_up]) and should_merge(lines[k_up],title):
+            title=(lines[k_up]+" "+title).strip(); k_up-=1
+        k_dn=best_k+1
+        while k_dn<len(lines) and looks_like_title_line(lines[k_dn]) and should_merge(title,lines[k_dn]):
+            title=(title+" "+lines[k_dn]).strip(); k_dn+=1
+        title=re.sub(r'\s{2,}',' ',title).strip()
+        amount=norm_amount(m.group("num"))
+        cur="USD" if m.group("cur") in ("$","USD") else "EUR"
+        win_lo=max(0,min(best_k,i)-8); win_hi=min(len(lines),max(best_k,i)+9)
+        material=dimensions=brand=None
+        for k in range(win_lo,win_hi):
+            linek=lines[k]
+            material=material or extract_material_from_text(linek)
+            dimensions=dimensions or extract_dimensions_from_text(linek)
+            brand=brand or extract_brand_from_text(linek)
+        if not brand: brand=extract_brand_from_text(title)
+        if not dimensions: dimensions=extract_dimensions_from_text(title)
+        items.append({"pos":len(items)+1,"qty":1,"unit":"pc","name":title or "Item",
+                      "material":material,"dimensions":dimensions,"brand":brand,
+                      "description":"","price":amount,"currency":cur})
+        if len(items)>=max_items: break
+    if DEBUG and items: print("Regex items:", json.dumps(items, indent=2)[:300], "...")
+    return items
+
+def extract_items(user_query, context, max_items=3):
+    data=extract_items_via_llm(user_query,context,max_items=max_items)
+    items=[it for it in data.get("items",[]) if it.get("name")]
+    if not items or all(it.get("price") in (None,"null") for it in items):
+        intent=parse_intent(user_query)
+        rb=extract_items_rule_based(context,intent,max_items=max_items)
+        if rb: return rb
+    return items
+
+# ----------------------------- #
+# Excel pricing
+# ----------------------------- #
+REQUIRED_COLS={"material_name","unit","unit_price_usd"}
+def autodetect_sheet(path:str)->str:
+    xl=pd.ExcelFile(path); name=EXCEL_SHEET or (xl.sheet_names[0] if xl.sheet_names else "Sheet1")
+    print(f"📄 Loaded sheet: {name}"); return name
+
+def load_material_costs_xlsx(path=COST_BOOK_PATH,sheet:Optional[str]=None):
+    if not os.path.exists(path): raise FileNotFoundError(f"Cost book not found at '{path}'.")
+    if sheet is None: sheet=autodetect_sheet(path)
+    df=pd.read_excel(path, sheet_name=sheet).fillna("")
+    missing=REQUIRED_COLS - set(df.columns)
+    if missing: raise ValueError(f"Cost sheet missing columns: {', '.join(sorted(missing))}")
+    df["material_name_norm"]=df["material_name"].astype(str).str.strip().str.lower()
+    df["unit_norm"]=df["unit"].astype(str).str.strip().str.lower()
+    df["key"]=df["material_name_norm"]+"|"+df["unit_norm"]
+    price_map={row["key"]: float(row["unit_price_usd"]) for _,row in df.iterrows()}
+    material_to_units:Dict[str,Dict[str,float]]={}
+    for _,row in df.iterrows():
+        m=row["material_name_norm"]; u=row["unit_norm"]; p=float(row["unit_price_usd"])
+        material_to_units.setdefault(m,{})[u]=p
+    allowed_materials=sorted(df["material_name_norm"].unique().tolist())
+    return price_map, material_to_units, allowed_materials, df
+
+def price_from_bom(spec: Dict[str,Any], price_map: Dict[str,float], material_to_units: Dict[str,Dict[str,float]]) -> float:
+    total=0.0
+    for m in spec.get("materials",[]):
+        name=(m.get("name") or "").strip().lower()
+        unit=(m.get("unit") or "").strip().lower()
+        qty=float(m.get("quantity") or 0.0)
+        if not name or not unit or qty<=0: continue
+        price = price_map.get(f"{name}|{unit}") or material_to_units.get(name,{}).get(unit)
+        if price is None:
+            if DEBUG: print(f"⚠ Missing price for material: {name} ({unit})")
+            continue
+        total += qty * float(price)
+    return round(total,2)
+
+def adjusted_unit_price(category:str, raw_unit_cost:float)->float:
+    base = raw_unit_cost * WASTAGE_FACTOR
+    floor = CATEGORY_MIN_USD.get((category or "").lower(), GENERIC_MIN_USD)
+    return max(base, floor)
+
+# ----------------------------- #
+# Multi-item BOM from user notes
+# ----------------------------- #
+def build_multi_bom_prompt(user_text:str, allowed_materials:List[str])->str:
+    mats = "\n".join(f"- {m}" for m in allowed_materials[:250])
+    return f"""
+SYSTEM: Extract ALL distinct furniture items from the note and output JSON with an "items" array.
+RULES:
+- Use ONLY materials from the allowed list. Use proper units (wood m³; metal kg; foam m³; leather/fabric m²; glass/marble m²).
+- Each item includes: name, category, qty, color, dimensions_cm (only keys you know), materials [{{name,unit,quantity}}].
+- Respect counts in the note (e.g., set of four -> qty:4). Return JSON only.
+
+ALLOWED_MATERIALS:
+{mats}
+
+USER NOTE:
+{user_text}
+
+OUTPUT EXAMPLE:
+{{
+  "items": [
+    {{
+      "name": "Round Bar Table (adjustable, swivel)",
+      "category": "table",
+      "qty": 1,
+      "color": "brown pine top / rustic copper steel base",
+      "dimensions_cm": {{"diameter": 60, "h_min": 98, "h_max": 123}},
+      "materials": [{{"name":"pine","unit":"m³","quantity":0.04}}, {{"name":"steel","unit":"kg","quantity":8.0}}]
+    }}
+  ]
+}}
+"""
+
+def get_multi_bom_from_llm(user_text:str, allowed_materials:List[str])->List[Dict[str,Any]]:
+    prompt = build_multi_bom_prompt(user_text, allowed_materials)
+    for _ in range(3):
+        out = together_chat(
+            [{"role":"system","content":"Return ONLY the JSON object with an 'items' array."},
+             {"role":"user","content": prompt}],
+            temperature=0.0, max_tokens=900
+        ).strip()
+        obj = extract_json_object(out)
+        if obj and isinstance(obj.get("items"), list) and obj["items"]:
+            return obj["items"]
+        if DEBUG: print("Multi-BOM parse failed. Raw:", out[:400], "...")
+    return []
+
+def quick_multi_bom_from_text(text:str)->List[Dict[str,Any]]:
+    t=text.lower(); items=[]
+    def add(name,cat,qty,color,dim_dict,mats):
+        items.append({"name":name,"category":cat,"qty":qty,"color":color,"dimensions_cm":dim_dict,"materials":mats})
+    desks_qty = 4 if "set of four" in t or "four adjustable desks" in t else (2 if "two desks" in t else (1 if "desk" in t else 0))
+    m = re.search(r'(\d+)\s*mm\s*diameter', t); diameter = (float(m.group(1))/10) if m else None
+    m = re.search(r'(\d+)\s*cm\s*(?:to|-|–|and)\s*(\d+)\s*cm', t); hmin=float(m.group(1)) if m else None; hmax=float(m.group(2)) if m else None
+    if "bar table" in t or "round bar table" in t or "tabletop can swivel" in t:
+        dims={}
+        if diameter: dims["diameter"]=round(diameter,1)
+        if hmin: dims["h_min"]=hmin
+        if hmax: dims["h_max"]=hmax
+        add("Round Bar Table (adjustable, swivel)","table",1,"brown pine top / rustic copper steel base",
+            dims, [{"name":"pine","unit":"m³","quantity":0.04},{"name":"steel","unit":"kg","quantity":8.0}])
+    if desks_qty>0:
+        add("Adjustable Desk","desk",desks_qty,"espresso frame, beige laminate",
+            {"w":88,"h":74},
+            [{"name":"mdf","unit":"m³","quantity":0.04},{"name":"steel","unit":"kg","quantity":6.0}])
+    if "futon" in t:
+        add("Ergonomic Futon (adjustable back)","futon",1,"beige frame, light grey fabric",
+            {"w":110,"d":50},
+            [{"name":"fabric","unit":"m²","quantity":6.0},{"name":"foam","unit":"m³","quantity":0.08},{"name":"steel","unit":"kg","quantity":6.0}])
+    if "wall shelf" in t or "industrial-style wall shelf" in t:
+        add("Industrial Wall Shelf (2-plank, bracketed)","shelf",1,"wood planks + black steel brackets",
+            {"w":80}, [{"name":"pine","unit":"m³","quantity":0.015},{"name":"steel","unit":"kg","quantity":2.0}])
+    if "lamp" in t:
+        add("Pendant Lamp (small)","lamp",1,"warm light",{},[{"name":"steel","unit":"kg","quantity":1.0}])
+    return items
+
+def build_priced_items_from_bom(items_bom:List[Dict[str,Any]], price_map, material_to_units)->List[Dict[str,Any]]:
+    out=[]
+    for spec in items_bom:
+        unit_raw = price_from_bom(spec, price_map, material_to_units)
+        unit_adj = adjusted_unit_price(spec.get("category",""), unit_raw)
+        qty = int(spec.get("qty") or 1)
+        line_total = round(unit_adj * qty, 2)
+
+        # dimensions text — show only known parts
+        dims = spec.get("dimensions_cm", {}) or {}
+        dim_txt = None
+        if "diameter" in dims:
+            parts=[f'{dims["diameter"]}Ø cm']
+            if "h_min" in dims and "h_max" in dims: parts.append(f'{dims["h_min"]}-{dims["h_max"]}H cm')
+            elif "h" in dims: parts.append(f'{dims["h"]}H cm')
+            dim_txt="; ".join(parts)
+        else:
+            parts=[]
+            if "w" in dims: parts.append(f'{dims["w"]}W')
+            if "d" in dims: parts.append(f'{dims["d"]}D')
+            if "h" in dims: parts.append(f'{dims["h"]}H')
+            if parts: dim_txt=" x ".join(parts) + " (cm)"
+
+        materials_list=" / ".join(sorted({m["name"] for m in spec.get("materials",[]) if m.get("name")}))
+
+        out.append({
+            "pos": len(out)+1,
+            "qty": qty,
+            "unit": "pc",
+            "name": (spec.get("name") or spec.get("category") or "Custom Item").strip().title(),
+            "material": materials_list or None,
+            "dimensions": dim_txt,               # None if nothing known
+            "brand": None,
+            "description": (spec.get("color") or "Custom build per customer specification."),
+            "price": line_total,                 # extended (qty×unit)
+            "unit_price_est": round(unit_adj,2), # store unit estimate for display
+            "currency": "USD"
+        })
+    return out
+
+# ----------------------------- #
+# PDF builder (with Dimensions column)
+# ----------------------------- #
+def currency_symbol(cur:str)->str:
+    return {"USD":"$","EUR":"€","GBP":"£","INR":"₹"}.get((cur or "USD").upper(),"$")
+
+def build_and_render_offer_pdf(offer_id, customer_name, customer_no, items, vat_rate=0.0, default_currency="USD", filename="offer.pdf"):
+
+    import fitz
+    from datetime import datetime
+
+    W, H = 595, 842          # A4 portrait
+    LM, TM, RM, BM = 36, 36, 36, 36
+    y = TM
+    line = 16
+    fs_h1, fs_h2, fs, fs_small = 18, 12, 11, 10
+
+    sym = {"USD":"$", "EUR":"€", "GBP":"£", "INR":"₹"}.get((items[0].get("currency") if items else default_currency).upper(), "$")
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    # Column layout: Pos | Qty | Description | Dimensions | Price
+    col_pos = LM
+    col_qty = col_pos + 40
+    col_desc = col_qty + 44
+    col_dim  = col_desc + 240
+    col_price = W - RM
+
+    def draw_text(page, x, y, text, size=fs):
+        page.insert_text(fitz.Point(x, y), text, fontsize=size, color=(0, 0, 0))
+
+    def draw_right(page, x_right, y, text, size=fs):
+        rect = fitz.Rect(LM, y - 12, x_right, y + 20)
+        try:
+            page.insert_textbox(rect, text, fontsize=size, align=fitz.TEXT_ALIGN_RIGHT)
+        except TypeError:
+            page.insert_text(fitz.Point(x_right - len(text)*6, y), text, fontsize=size, color=(0,0,0))
+
+    def wrap_to_width(text, max_width_pt):
+        if not text:
+            return []
+        approx_char = int(max_width_pt / 6.0)
+        words = text.split()
+        out, cur = [], ""
+        for w in words:
+            cand = (cur + " " + w).strip()
+            if len(cand) > approx_char:
+                if cur: out.append(cur)
+                cur = w
+            else:
+                cur = cand
+        if cur: out.append(cur)
+        return out
+
+    def fmt_price(amount):
+        if amount is None: return "TBD"
+        return f"{sym}{amount:,.2f}"
+
+    doc = fitz.open()
+    page = doc.new_page(width=W, height=H)
+
+    draw_text(page, LM, y, f"Offer ID: {offer_id}", fs_h1); y += line*1.6
+    draw_text(page, LM, y, f"Customer: {customer_name}", fs_h2); y += line
+    # draw_text(page, LM, y, f"Customer No: {customer_no}", fs_h2); y += line
+    draw_text(page, LM, y, f"Date: {today}", fs_h2); y += line*1.4
+    draw_text(page, LM, y, "We are pleased to present you with an offer for the following items:", fs); y += line*1.3
+
+    page.draw_rect(fitz.Rect(LM, y - 10, W - RM, y - 9), color=(0, 0, 0), fill=(0, 0, 0))
+    draw_text(page, col_pos,  y, "Pos", fs_small)
+    draw_text(page, col_qty,  y, "Qty", fs_small)
+    draw_text(page, col_desc, y, "Description", fs_small)
+    draw_text(page, col_dim,  y, "Dimensions", fs_small)
+    draw_right(page, col_price, y, "Price", fs_small)
+    y += line
+
+    net = 0.0
+    for idx, it in enumerate(items, 1):
+        pos  = f"{idx:03}"
+        qty  = int(it.get("qty", 1))
+        unit = it.get("unit", "pc")
+        name = (it.get("name") or "Item").strip()
+        material = it.get("material")
+        dims_txt = it.get("dimensions") or ""    # will show if present
+        brand = it.get("brand")
+        desc = it.get("description") or ""
+        line_total = it.get("price")
+        unit_est   = it.get("unit_price_est")
+
+        desc_lines = [name]
+        if material: desc_lines.append(f"Material: {material}")
+        if brand:    desc_lines.append(f"Brand: {brand}")
+        if desc:     desc_lines.append(desc)
+        if unit_est is not None:
+            desc_lines.append(f"Pricing: {fmt_price(unit_est)} × Qty {qty} = {fmt_price(line_total)}")
+
+        wrapped_desc = []
+        for t in desc_lines:
+            wrapped_desc.extend(wrap_to_width(t, (col_dim - 10) - col_desc))
+
+        wrapped_dim  = wrap_to_width(dims_txt, (col_price - 20) - col_dim) if dims_txt else []
+
+        row_lines = max(1, max(len(wrapped_desc), len(wrapped_dim)))
+
+        draw_text(page, col_pos, y, pos)
+        draw_text(page, col_qty, y, str(qty))
+        draw_text(page, col_qty, y + line*0.9, unit, fs_small)
+
+        if wrapped_desc:
+            draw_text(page, col_desc, y, wrapped_desc[0])
+        else:
+            draw_text(page, col_desc, y, name)
+
+        if wrapped_dim:
+            draw_text(page, col_dim, y, wrapped_dim[0])
+
+        draw_right(page, col_price, y, fmt_price(line_total))
+
+        for i in range(1, row_lines):
+            if i < len(wrapped_desc):
+                draw_text(page, col_desc, y + i*line, wrapped_desc[i])
+            if i < len(wrapped_dim):
+                draw_text(page, col_dim,  y + i*line, wrapped_dim[i])
+
+        y += row_lines*line + 6
+        page.draw_rect(fitz.Rect(LM, y - 6, W - RM, y - 5), color=(0.85,0.85,0.85), fill=(0.85,0.85,0.85))
+        y += 4
+
+        if isinstance(line_total, (int, float)):
+            net += float(line_total)
+
+        if y > H - BM - 200:
+            page = doc.new_page(width=W, height=H)
+            y = TM
+
+    y += line*1.5
+    vat = net * vat_rate
+    total = net + vat
+    draw_right(page, col_price, y, f"Net price: {fmt_price(net if net else None)}"); y += line*1.2
+    draw_right(page, col_price, y, f"VAT ({int(vat_rate*100)}%): {fmt_price(vat if net else None)}"); y += line*1.2
+    draw_right(page, col_price, y, f"Total cost of the order: {fmt_price(total if net else None)}"); y += line*1.5
+
+    for t in ["- Offer valid for 8 weeks",
+              "- 40% advance payment due within 8 days",
+              "- Balance due in 8 weeks"]:
+        draw_text(page, LM, y, t, fs); y += line
+
+    y += line
+    draw_text(page, LM, y, "Best regards,", fs); y += line
+    draw_text(page, LM, y, "XYZ", fs); y += line
+
+    doc.save(filename)
+    doc.close()
+    print(f"✅ PDF offer saved to: {filename}")
+
+# ----------------------------- #
+# NOTE → DIMENSIONS HELPERS  (module scope!)
+# ----------------------------- #
+DIM_MM = r'(\d{2,4})\s*mm'  # 2–4 digits in mm
+
+def mm_to_cm(mm: str) -> Optional[str]:
+    try:
+        return f"{round(float(mm)/10.0):.0f}"
+    except Exception:
+        return None
+
+def extract_dimensions_from_note(note: str) -> dict:
+    """
+    Return canonical dimension strings per item category from a free-text note.
+    Keys: 'futon', 'sofa', 'desk', 'nightstand', 'table'
+    Values: '80W x 60D x 90H (cm)', '60Ø; 98-123H (cm)', etc.  (no '?')
+    """
+    s = " ".join(note.lower().split())
+    dims = {}
+
+    # Futon: "...980 mm wide ... 550 mm high"
+    m = re.search(r'futon[^.]*?'+DIM_MM+r'[^.]*?(?:wide|width)[^.]*?'+DIM_MM+r'[^.]*?(?:high|height)', s)
+    if m:
+        w_cm = mm_to_cm(m.group(1))
+        h_cm = mm_to_cm(m.group(2))
+        parts=[]
+        if w_cm: parts.append(f"{w_cm}W")
+        if h_cm: parts.append(f"{h_cm}H")
+        if parts: dims['futon'] = " x ".join(parts) + " (cm)"
+
+    # Sofa piece: "...860 mm long ... 440 mm high"
+    m = re.search(r'(?:sectional\s+)?sofa[^.]*?(?:piece)?[^.]*?'+DIM_MM+r'[^.]*?(?:long|length)[^.]*?'+DIM_MM+r'[^.]*?(?:high|height)', s)
+    if m:
+        l_cm = mm_to_cm(m.group(1))
+        h_cm = mm_to_cm(m.group(2))
+        parts=[]
+        if l_cm: parts.append(f"{l_cm}W")
+        if h_cm: parts.append(f"{h_cm}H")
+        if parts: dims['sofa'] = " x ".join(parts) + " (cm)"
+
+    # Desk: "...desk stands at 490 mm tall"
+    m = re.search(r'desk[^.]*?'+DIM_MM+r'[^.]*?(?:tall|high|height)', s)
+    if m:
+        h_cm = mm_to_cm(m.group(1))
+        if h_cm: dims['desk'] = f"{h_cm}H (cm)"
+
+    # Nightstand: "...nightstands are around 740 mm high"
+    m = re.search(r'nightstand[^.]*?'+DIM_MM+r'[^.]*?(?:high|height)', s)
+    if m:
+        h_cm = mm_to_cm(m.group(1))
+        if h_cm: dims['nightstand'] = f"{h_cm}H (cm)"
+
+    # Round table: diameter + height range if present (Ø from mm; height range from cm)
+    m_d = re.search(r'(?:round\s+)?table[^.]*?'+DIM_MM+r'[^.]*?(?:diameter|ø)', s)
+    m_h = re.search(r'(?:round\s+)?table[^.]*?(\d{2,3})\s*cm\s*(?:to|-|–|and)\s*(\d{2,3})\s*cm', s)
+    parts=[]
+    if m_d:
+        d_cm = mm_to_cm(m_d.group(1))
+        if d_cm: parts.append(f"{d_cm}Ø")
+    if m_h:
+        parts.append(f"{m_h.group(1)}-{m_h.group(2)}H")
+    if parts: dims['table'] = "; ".join(parts) + " (cm)"
+
+    return dims
+
+def inject_dimensions_into_items(items: list, note_dims: dict) -> list:
+    """
+    Overwrite or attach dimensions per item with the ones parsed from the user's note.
+    This guarantees the Dimensions column shows values when the note included them.
+    """
+    if not items or not note_dims:
+        return items
+
+    def pick_key(name: str) -> Optional[str]:
+        n = (name or "").lower()
+        if "futon" in n: return "futon"
+        if "sofa" in n or "sectional" in n or "couch" in n: return "sofa"
+        if "desk" in n: return "desk"
+        if "table" in n: return "table"
+        if "nightstand" in n: return "nightstand"
+        return None
+
+    for it in items:
+        key = pick_key(it.get("name", ""))
+        if key and note_dims.get(key):
+            it["dimensions"] = note_dims[key]    # always overwrite to ensure visibility
+    return items
+
+# ----------------------------- #
+# Customer name/number parsing
+# ----------------------------- #
+def parse_customer_from_note(note:str)->Tuple[str,str]:
+    m = re.search(r'\bcustomer\s+([A-Z][a-zA-Z\-]+)', note)
+    name = (m.group(1).strip().title() if m else "Customer")
+    number=str(random.randint(1000,9999))
+    return name, number
+
+# ----------------------------- #
+# MAIN
+# ----------------------------- #
+if __name__ == "__main__":
+    user_query = input("Paste the furniture note / request: ").strip()
+
+    # Try to extract customer name from the note
+    customer_name, _ = parse_customer_from_note(user_query)
+
+    # If no name found in the text, ask manually
+    if customer_name.lower() == "customer":
+        customer_name = input("Please enter the customer's name: ").strip().title()
+        if not customer_name:
+            print("❌ Customer name is required to generate the offer.")
+            raise SystemExit(0)
+
+    # Continue with normal flow
+    price_map, material_to_units, allowed_materials, _ = load_material_costs_xlsx(COST_BOOK_PATH, EXCEL_SHEET)
+    chunked_docs, full_docs = load_offer_documents("offers")
+    faiss_store, bm25_retriever = create_vectorstores(chunked_docs)
+
+    multi_note = len(user_query) > 300 or sum(1 for w in ["table","desk","sofa","futon","shelf","chair","lamp"] if w in user_query.lower()) >= 2
+    items = []
+
+    if not multi_note:
+        match_type, matched_docs = match_product(user_query, faiss_store, bm25_retriever, all_chunks=chunked_docs, full_docs=full_docs)
+
+        # NEW: If no exact/usable matches, ask whether to proceed with similar/custom items
+        if match_type == "none":
+            ans = input("No exact catalog items found. Generate an offer with similar/custom items? (yes/no): ").strip().lower()
+            if ans != "yes":
+                print(DECLINE_MSG)
+                raise SystemExit(0)
+            multi_note = True
+        else:
+            if match_type == "similar":
+                print("🤝 No exact match found. Closest items:")
+                for i, d in enumerate(matched_docs, 1):
+                    print(f"\n[{i}] {d.metadata.get('source_file','?')}\n{d.page_content[:300]}...")
+                if input("\nProceed with a similar item? (yes/no): ").strip().lower() != "yes":
+                    print(DECLINE_MSG)
+                    raise SystemExit(0)
+            context = "\n\n---\n\n".join([d.page_content[:1500] for d in matched_docs])
+            items = extract_items(user_query, context, max_items=3)
+            if (not items) or all(it.get("price") in (None,"null") for it in items):
+                multi_note = True
+
+    if multi_note:
+        print("ℹ Using custom multi-item Excel-priced BOM...")
+        bom_items = get_multi_bom_from_llm(user_query, allowed_materials) or quick_multi_bom_from_text(user_query)
+        if not bom_items:
+            ans = input("Could not derive BOM. Try generating offer with similar items anyway? (yes/no): ").strip().lower()
+            if ans != "yes":
+                print(DECLINE_MSG)
+                raise SystemExit(0)
+        items = build_priced_items_from_bom(bom_items, price_map, material_to_units)
+
+    if not items:
+        print(DECLINE_MSG)
+        raise SystemExit(0)
+
+    note_dims = extract_dimensions_from_note(user_query)
+    items = inject_dimensions_into_items(items, note_dims)
+
+    os.makedirs("generated_offers", exist_ok=True)
+    offer_id = "OFFER_" + datetime.now().strftime("%Y%m%d") + "_" + str(uuid.uuid4())[:4].upper()
+    output_file = os.path.join("generated_offers", f"{offer_id}.pdf")
+
+    build_and_render_offer_pdf(
+        offer_id=offer_id,
+        customer_name=customer_name,
+        customer_no='',
+        items=items,
+        vat_rate=0.00,
+        default_currency="USD",
+        filename=output_file,
+    )
+    print(f"🎉 Offer successfully generated: {output_file}")
+

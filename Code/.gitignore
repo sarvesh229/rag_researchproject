@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+.build/
+
+# Virtual envs (Windows + Unix)
+venv/
+.env/
+.venv/
+env/
+ragoffer/Lib/
+ragoffer/Scripts/
+ragoffer/pyvenv.cfg
+
+# IDE
+.vscode/
+.idea/
