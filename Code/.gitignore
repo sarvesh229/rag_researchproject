@@ -13,7 +13,9 @@ env/
 ragoffer/Lib/
 ragoffer/Scripts/
 ragoffer/pyvenv.cfg
-
+rag/
 # IDE
 .vscode/
 .idea/
+
+faiss_index/
